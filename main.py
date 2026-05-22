@@ -17,16 +17,14 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
 
-# ---- CONFIG ----
-api_id    = int(os.getenv("API_ID",   "0"))
-api_hash  = os.getenv("API_HASH",     "")
-BOT_TOKEN = os.getenv("BOT_TOKEN",    "")
-OWNER_ID  = int(os.getenv("OWNER_ID", "0"))
-MAX_GROUPS  = 5
-DATA_FILE   = "groups_data.json"
-LINK_REGEX     = re.compile(r"https?://\S+", re.IGNORECASE)
-AMAZON_REGEX   = re.compile(r"https?://(?:www\.)?amazon\.in\S+", re.IGNORECASE)
-AFFILIATE_TAG  = os.getenv("AFFILIATE_TAG", "dealskoti-21")
+from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID, MAX_GROUPS, AFFILIATE_TAG
+from storage import save_to_telegram, load_from_telegram
+
+# ---- ALIASES (config.py se aa rahe hain) ----
+api_id   = API_ID
+api_hash = API_HASH
+
+LINK_REGEX = re.compile(r"https?://\S+", re.IGNORECASE)
 
 # ---- STATE ----
 groups      = {}   # { gid(int): { name, incoming(set), outgoing(set), active } }
@@ -49,42 +47,14 @@ login_state = {
 # ====================================================================
 
 def save_groups():
-    """groups dict ko disk pe save karo (sets ko lists mein convert karke)."""
-    try:
-        data = {}
-        for gid, g in groups.items():
-            data[str(gid)] = {
-                "name":     g["name"],
-                "incoming": list(g["incoming"]),
-                "outgoing": list(g["outgoing"]),
-                "active":   g["active"],
-            }
-        with open(DATA_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print("Save error:", e)
+    """Settings ko Telegram Saved Messages mein save karo (restart-proof)."""
+    asyncio.get_event_loop().create_task(save_to_telegram(client, groups))
 
 
-def load_groups():
-    """Disk se groups load karo. Agar file nahi hai toh kuch nahi karo."""
+async def async_load_groups():
+    """Telegram Saved Messages se settings load karo."""
     global groups
-    if not os.path.exists(DATA_FILE):
-        return
-    try:
-        with open(DATA_FILE, "r") as f:
-            data = json.load(f)
-        groups = {}
-        for gid_str, g in data.items():
-            gid = int(gid_str)
-            groups[gid] = {
-                "name":     g["name"],
-                "incoming": set(g["incoming"]),
-                "outgoing": set(g["outgoing"]),
-                "active":   g.get("active", False),
-            }
-        print(f"Loaded {len(groups)} group(s) from {DATA_FILE}")
-    except Exception as e:
-        print("Load error:", e)
+    groups = await load_from_telegram(client)
 
 
 # ====================================================================
@@ -1122,13 +1092,14 @@ async def forwarder(event):
 # ====================================================================
 
 async def on_startup(_dispatcher):
-    load_groups()
     await client.connect()
     if await client.is_user_authorized():
         print("Already logged in — dialogs load ho rahe hain...")
         await load_dialogs()
+        # Settings Telegram Saved Messages se load karo
+        await async_load_groups()
         print(f"DealsKoti Forward Bot ready! {len(all_dialogs)} dialogs loaded.")
-        print(f"{len(groups)} group(s) loaded from disk.")
+        print(f"{len(groups)} group(s) restored from Telegram.")
     else:
         print("Not logged in. Bot se /login karo.")
     print("Bot is running!")
