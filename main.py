@@ -1,175 +1,139 @@
+"""
+DealsKoti Auto-Forwarder Bot — Enhanced Edition
+Features: Keyword Filter, Blacklist, Word Replace, Caption, Live Edit Sync
+Storage:  PostgreSQL (Railway persistent)
+Restart:  Auto via Procfile shell loop
+"""
 import asyncio
-import io
-import os
 import re
-import json
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telethon import TelegramClient, events
-from telethon.tl.types import MessageMediaWebPage
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
     PasswordHashInvalidError,
 )
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils import executor
+from telethon.tl.types import MessageMediaWebPage
 
-from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID, MAX_GROUPS, AFFILIATE_TAG
-from storage import save_to_telegram, load_from_telegram
+import storage
+from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID, MAX_GROUPS
 
-# ---- ALIASES (config.py se aa rahe hain) ----
-api_id   = API_ID
-api_hash = API_HASH
-
-LINK_REGEX = re.compile(r"https?://\S+", re.IGNORECASE)
-
-# ---- STATE ----
-groups      = {}   # { gid(int): { name, incoming(set), outgoing(set), active } }
-all_dialogs = []   # [ (chat_id, name), ... ]
-user_state  = {}   # { uid: { action, group_id } }
+# ====================================================================
+# INIT
+# ====================================================================
 
 bot    = Bot(token=BOT_TOKEN)
 dp     = Dispatcher(bot)
-client = TelegramClient("session", api_id, api_hash)
+client = TelegramClient("session", API_ID, API_HASH)
 
-login_state = {
-    "phone":      None,
-    "phone_hash": None,
-    "step":       None,   # None | "phone" | "otp" | "2fa"
-}
+# In-memory state (synced from DB on startup)
+groups:      dict[int, dict] = {}   # gid -> group dict
+all_dialogs: list[tuple[int, str]] = []  # (chat_id, name)
 
-
-# ====================================================================
-# PERSISTENCE  —  groups ko JSON file mein save/load karo
-# ====================================================================
-
-def save_groups():
-    """Settings ko Telegram Saved Messages mein save karo (restart-proof)."""
-    asyncio.get_event_loop().create_task(save_to_telegram(client, groups))
-
-
-async def async_load_groups():
-    """Telegram Saved Messages se settings load karo."""
-    global groups
-    groups = await load_from_telegram(client)
+login_state: dict = {"step": None, "phone": None, "phone_hash": None}
+user_state:  dict = {}   # uid -> {"action": ..., "group_id": ..., ...}
 
 
 # ====================================================================
 # HELPERS
 # ====================================================================
 
-def is_owner(uid):
+def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
 
 
-def next_gid():
-    for i in range(1, MAX_GROUPS + 1):
-        if i not in groups:
-            return i
-    return None
-
-
-def has_link(text: str) -> bool:
-    """Check karo ki string mein koi URL hai ya nahi."""
-    if not text:
-        return False
-    return bool(LINK_REGEX.search(text))
-
-
-def clean_amazon_url(url: str) -> str:
-    """
-    Amazon URL ko clean karo:
-    - Search URL (/s?): sirf k, rh, tag rakho — baaki sab hata do
-    - Product URL (/dp/ASIN): sirf clean dp URL + ek tag rakho
-    - Duplicate tag=... bhi remove ho jaayega
-    - Affiliate tag ensure karo (AFFILIATE_TAG)
-    """
-    try:
-        parsed = urlparse(url)
-        path   = parsed.path
-
-        # --- Search URL: amazon.in/s?k=... ---
-        if re.search(r"^/s\b", path):
-            params = parse_qs(parsed.query, keep_blank_values=False)
-            clean_params = {}
-            if "k" in params:
-                clean_params["k"] = params["k"][0]
-            if "rh" in params:
-                clean_params["rh"] = params["rh"][0]
-            clean_params["tag"] = AFFILIATE_TAG
-            clean_query = urlencode(clean_params)
-            return urlunparse((parsed.scheme, parsed.netloc, path, "", clean_query, ""))
-
-        # --- Product URL: amazon.in/dp/ASIN or amazon.in/.../dp/ASIN/... ---
-        dp_match = re.search(r"(/dp/[A-Z0-9]{10})", path, re.IGNORECASE)
-        if dp_match:
-            clean_path  = dp_match.group(1)
-            clean_query = urlencode({"tag": AFFILIATE_TAG})
-            return urlunparse((parsed.scheme, parsed.netloc, clean_path, "", clean_query, ""))
-
-        # --- Koi aur Amazon URL: sirf duplicate tag fix karo ---
-        params = parse_qs(parsed.query, keep_blank_values=False)
-        params["tag"] = [AFFILIATE_TAG]
-        clean_query = urlencode({k: v[0] for k, v in params.items()})
-        return urlunparse((parsed.scheme, parsed.netloc, path, "", clean_query, ""))
-
-    except Exception:
-        return url
-
-
-def clean_text_urls(text: str) -> str:
-    """
-    Text mein jo bhi Amazon URLs hain unhe clean_amazon_url se replace karo.
-    Non-Amazon URLs untouched rahenge.
-    """
-    if not text:
-        return text
-
-    def replace_url(match):
-        url = match.group(0)
-        parsed = urlparse(url)
-        if "amazon.in" in parsed.netloc.lower():
-            return clean_amazon_url(url)
-        return url
-
-    return LINK_REGEX.sub(replace_url, text)
-
-
-async def load_dialogs():
-    global all_dialogs
-    if not client.is_connected() or not await client.is_user_authorized():
-        return
-    try:
-        result = await client.get_dialogs()
-        all_dialogs = []
-        for d in result:
-            name = d.name or getattr(d, "title", None) or "Unnamed"
-            all_dialogs.append((d.id, name))
-    except Exception as err:
-        print("Dialog load error:", err)
-
-
-def get_dname(did):
-    for d_id, d_name in all_dialogs:
-        if d_id == did:
-            return d_name
+def get_dname(did: int) -> str:
+    for cid, name in all_dialogs:
+        if cid == did:
+            return name
     return str(did)
 
 
-def get_dialog(idx):
-    if 0 <= idx < len(all_dialogs):
-        return all_dialogs[idx]
-    return None
-
-
-async def is_logged_in():
+async def is_logged_in() -> bool:
     try:
-        return client.is_connected() and await client.is_user_authorized()
+        return await client.is_user_authorized()
     except Exception:
         return False
+
+
+async def load_dialogs():
+    all_dialogs.clear()
+    async for d in client.iter_dialogs():
+        all_dialogs.append((d.id, d.name or str(d.id)))
+    print(f"[Dialogs] {len(all_dialogs)} loaded.")
+
+
+# ====================================================================
+# FILTER / TRANSFORM HELPERS
+# ====================================================================
+
+def passes_filters(text: str, g: dict) -> bool:
+    """Return True if message should be forwarded, False if it should be skipped."""
+    lower = (text or "").lower()
+
+    # Blacklist — skip if any blacklist word found
+    for word in g.get("blacklist", set()):
+        if word.lower() in lower:
+            return False
+
+    # Keywords (whitelist) — if list non-empty, at least one must match
+    kws = g.get("keywords", set())
+    if kws:
+        if not any(kw.lower() in lower for kw in kws):
+            return False
+
+    return True
+
+
+def apply_replacements(text: str, g: dict) -> str:
+    """Apply all word/link replacements defined for this group."""
+    if not text:
+        return text
+    for old, new in g.get("replacements", {}).items():
+        text = text.replace(old, new)
+    return text
+
+
+def apply_caption(original: str, g: dict) -> str:
+    """Handle caption_mode: keep / add / remove."""
+    mode = g.get("caption_mode", "keep")
+    extra = g.get("caption_text", "")
+    if mode == "remove":
+        return ""
+    if mode == "add":
+        if original:
+            return f"{original}\n{extra}" if extra else original
+        return extra
+    return original  # keep
+
+
+def process_text(text: str, g: dict) -> str:
+    """Apply replacements then caption logic on a plain text message."""
+    text = apply_replacements(text or "", g)
+    return apply_caption(text, g)
+
+
+def process_media_caption(caption: str, g: dict) -> str:
+    """Apply replacements then caption logic on a media caption."""
+    caption = apply_replacements(caption or "", g)
+    return apply_caption(caption, g)
+
+
+def has_link(text: str) -> bool:
+    return bool(re.search(r"https?://|t\.me/", text or ""))
+
+
+def clean_text_urls(text: str) -> str:
+    return text
+
+
+async def _copy_with_download(tgt_id: int, m):
+    path = await client.download_media(m)
+    if path:
+        await client.send_file(tgt_id, path, caption=m.message or "")
 
 
 # ====================================================================
@@ -178,93 +142,127 @@ async def is_logged_in():
 
 def kb_login():
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Login karo", callback_data="do_login"))
+    kb.add(InlineKeyboardButton("🔑 Login", callback_data="do_login"))
     return kb
 
 
 def kb_main():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("Incoming Channel", callback_data="menu_inc"),
-        InlineKeyboardButton("Outgoing Channel", callback_data="menu_out"),
+        InlineKeyboardButton("📋 Manage Groups", callback_data="grp_list"),
+        InlineKeyboardButton("📊 Status",        callback_data="st"),
     )
     kb.add(
-        InlineKeyboardButton("Start Forwarding", callback_data="quick_start"),
-        InlineKeyboardButton("Stop Forwarding",  callback_data="quick_stop"),
+        InlineKeyboardButton("❓ Help",   callback_data="hl"),
+        InlineKeyboardButton("🗑 Dismiss", callback_data="dm"),
     )
-    kb.add(
-        InlineKeyboardButton("Status",       callback_data="st"),
-        InlineKeyboardButton("Help",         callback_data="hl"),
-    )
-    kb.add(InlineKeyboardButton("Manage Groups", callback_data="grp_list"))
     return kb
 
 
 def kb_groups():
-    kb = InlineKeyboardMarkup(row_width=1)
-    for gid, g in groups.items():
-        icon  = "ON" if g["active"] else "OFF"
-        label = f"[{icon}] {g['name']}"
-        kb.add(InlineKeyboardButton(label, callback_data=f"grp:{gid}"))
-    if next_gid():
-        kb.add(InlineKeyboardButton("+ New Group", callback_data="ng"))
-    kb.add(InlineKeyboardButton("Main Menu", callback_data="mm"))
+    kb = InlineKeyboardMarkup(row_width=3)
+    buttons = [
+        InlineKeyboardButton(g["name"], callback_data=f"grp:{gid}")
+        for gid, g in groups.items()
+    ]
+    if buttons:
+        kb.add(*buttons)
+    kb.row(InlineKeyboardButton("➕ New Group", callback_data="ng"))
+    kb.row(InlineKeyboardButton("🏠 Main Menu",  callback_data="mm"))
     return kb
 
 
-def kb_group(gid):
-    g = groups.get(gid)
-    if not g:
-        return kb_main()
-    toggle_btn = (
-        InlineKeyboardButton("Stop Group",  callback_data=f"gx:{gid}")
-        if g["active"] else
-        InlineKeyboardButton("Start Group", callback_data=f"gs:{gid}")
-    )
+def kb_group(gid: int):
+    g = groups.get(gid, {})
+    status_icon = "🟢" if g.get("active") else "🔴"
+    toggle_cb   = f"gx:{gid}" if g.get("active") else f"gs:{gid}"
+    toggle_txt  = f"{status_icon} Stop" if g.get("active") else f"{status_icon} Start"
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("Incoming", callback_data=f"gi:{gid}"),
-        InlineKeyboardButton("Outgoing", callback_data=f"go:{gid}"),
+        InlineKeyboardButton("📥 Incoming", callback_data=f"gi:{gid}"),
+        InlineKeyboardButton("📤 Outgoing", callback_data=f"go:{gid}"),
     )
-    kb.add(toggle_btn, InlineKeyboardButton("Rename", callback_data=f"gr:{gid}"))
-    kb.add(InlineKeyboardButton("Delete Group", callback_data=f"gd:{gid}"))
     kb.add(
-        InlineKeyboardButton("Back to Groups", callback_data="grp_list"),
-        InlineKeyboardButton("Main Menu",      callback_data="mm"),
+        InlineKeyboardButton(toggle_txt,      callback_data=toggle_cb),
+        InlineKeyboardButton("⚙️ Settings",   callback_data=f"cfg:{gid}"),
     )
+    kb.add(
+        InlineKeyboardButton("✏️ Rename",     callback_data=f"rn:{gid}"),
+        InlineKeyboardButton("🗑 Delete",     callback_data=f"gd:{gid}"),
+    )
+    kb.row(InlineKeyboardButton("🔙 Back", callback_data="grp_list"))
     return kb
 
 
-def text_channel_list(gid, mode):
-    g = groups.get(gid)
-    if not g:
-        return "Group nahi mila."
-    selected = g["incoming"] if mode == "in" else g["outgoing"]
-    if not all_dialogs:
-        return "Koi channel/bot nahi mila."
-    lines = []
-    for i, (did, dn) in enumerate(all_dialogs):
-        marker = " ✅" if did in selected else ""
-        lines.append(f"{i + 1} - {dn}{marker}")
-    return "\n".join(lines)
+def kb_settings(gid: int):
+    g = groups.get(gid, {})
+    cap_mode = g.get("caption_mode", "keep")
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🔍 Keyword Filter",  callback_data=f"kw:{gid}"))
+    kb.add(InlineKeyboardButton("🚫 Blacklist",        callback_data=f"bl:{gid}"))
+    kb.add(InlineKeyboardButton("✏️ Word Replace",     callback_data=f"rp:{gid}"))
+    kb.add(InlineKeyboardButton(f"📝 Caption ({cap_mode})", callback_data=f"cap:{gid}"))
+    kb.add(InlineKeyboardButton("🔙 Back",             callback_data=f"grp:{gid}"))
+    return kb
 
 
-def kb_channels(gid, mode):
-    g = groups.get(gid)
-    if not g:
-        return kb_main()
-    if mode == "in":
-        selected = g["incoming"]
-        pfx      = "si"
-        all_cb   = f"sia:{gid}"
-        clear_cb = f"sic:{gid}"
-        confirm  = f"gc:{gid}"
-    else:
-        selected = g["outgoing"]
-        pfx      = "to"
-        all_cb   = f"toa:{gid}"
-        clear_cb = f"toc:{gid}"
-        confirm  = f"gco:{gid}"
+def kb_keyword(gid: int):
+    g = groups.get(gid, {})
+    kws = sorted(g.get("keywords", set()))
+    kb = InlineKeyboardMarkup(row_width=1)
+    for kw in kws:
+        kb.add(InlineKeyboardButton(f"❌ {kw}", callback_data=f"kwdel:{gid}:{kw}"))
+    kb.add(InlineKeyboardButton("➕ Add Keyword", callback_data=f"kwadd:{gid}"))
+    kb.add(InlineKeyboardButton("🔙 Back",        callback_data=f"cfg:{gid}"))
+    return kb
+
+
+def kb_blacklist(gid: int):
+    g = groups.get(gid, {})
+    words = sorted(g.get("blacklist", set()))
+    kb = InlineKeyboardMarkup(row_width=1)
+    for w in words:
+        kb.add(InlineKeyboardButton(f"❌ {w}", callback_data=f"bldel:{gid}:{w}"))
+    kb.add(InlineKeyboardButton("➕ Add Word", callback_data=f"bladd:{gid}"))
+    kb.add(InlineKeyboardButton("🔙 Back",      callback_data=f"cfg:{gid}"))
+    return kb
+
+
+def kb_replace(gid: int):
+    g = groups.get(gid, {})
+    pairs = g.get("replacements", {})
+    kb = InlineKeyboardMarkup(row_width=1)
+    for old, new in pairs.items():
+        short = f"{old[:15]} → {new[:15]}"
+        kb.add(InlineKeyboardButton(f"❌ {short}", callback_data=f"rpdel:{gid}:{old}"))
+    kb.add(InlineKeyboardButton("➕ Add Rule", callback_data=f"rpadd:{gid}"))
+    kb.add(InlineKeyboardButton("🔙 Back",      callback_data=f"cfg:{gid}"))
+    return kb
+
+
+def kb_caption(gid: int):
+    g = groups.get(gid, {})
+    mode = g.get("caption_mode", "keep")
+    kb = InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        InlineKeyboardButton(("✅ " if mode == "keep"   else "") + "Keep",   callback_data=f"capmode:{gid}:keep"),
+        InlineKeyboardButton(("✅ " if mode == "add"    else "") + "Add",    callback_data=f"capmode:{gid}:add"),
+        InlineKeyboardButton(("✅ " if mode == "remove" else "") + "Remove", callback_data=f"capmode:{gid}:remove"),
+    )
+    if mode == "add":
+        kb.add(InlineKeyboardButton("✏️ Set Caption Text", callback_data=f"captext:{gid}"))
+    kb.add(InlineKeyboardButton("🔙 Back", callback_data=f"cfg:{gid}"))
+    return kb
+
+
+def kb_channel_select(gid: int, direction: str):
+    g = groups[gid]
+    selected = g["incoming"] if direction == "incoming" else g["outgoing"]
+    pfx       = "fr" if direction == "incoming" else "to"
+    all_cb    = f"{'fia' if direction=='incoming' else 'toa'}:{gid}"
+    clear_cb  = f"{'fic' if direction=='incoming' else 'toc'}:{gid}"
+    confirm   = f"gci:{gid}" if direction == "incoming" else f"gco:{gid}"
+
     kb = InlineKeyboardMarkup(row_width=5)
     buttons = []
     for i, (did, dn) in enumerate(all_dialogs):
@@ -284,51 +282,14 @@ def kb_channels(gid, mode):
     return kb
 
 
-def kb_after_incoming(gid):
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("Set Outgoing Channel", callback_data=f"go:{gid}"))
-    kb.add(InlineKeyboardButton("Group Settings",       callback_data=f"grp:{gid}"))
-    kb.add(InlineKeyboardButton("Main Menu",            callback_data="mm"))
-    kb.add(InlineKeyboardButton("Dismiss",              callback_data="dm"))
-    return kb
-
-
-def kb_after_outgoing(gid):
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("Start Forwarding", callback_data=f"gs:{gid}"))
-    kb.add(InlineKeyboardButton("Group Settings",   callback_data=f"grp:{gid}"))
-    kb.add(InlineKeyboardButton("Main Menu",        callback_data="mm"))
-    kb.add(InlineKeyboardButton("Dismiss",          callback_data="dm"))
-    return kb
-
-
-def kb_after_start(gid):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("Status",     callback_data="st"),
-        InlineKeyboardButton("Stop Group", callback_data=f"gx:{gid}"),
-    )
-    kb.add(InlineKeyboardButton("Main Menu", callback_data="mm"))
-    return kb
-
-
-def kb_delete_confirm(gid):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("Yes, Delete", callback_data=f"gdf:{gid}"),
-        InlineKeyboardButton("No, Cancel",  callback_data=f"grp:{gid}"),
-    )
-    return kb
-
-
 def kb_status():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("Start All", callback_data="sa"),
-        InlineKeyboardButton("Stop All",  callback_data="xa"),
+        InlineKeyboardButton("▶️ Start All", callback_data="sa"),
+        InlineKeyboardButton("⏹ Stop All",  callback_data="xa"),
     )
-    kb.add(InlineKeyboardButton("Manage Groups", callback_data="grp_list"))
-    kb.add(InlineKeyboardButton("Main Menu",     callback_data="mm"))
+    kb.add(InlineKeyboardButton("📋 Manage Groups", callback_data="grp_list"))
+    kb.add(InlineKeyboardButton("🏠 Main Menu",     callback_data="mm"))
     return kb
 
 
@@ -339,29 +300,46 @@ def kb_status():
 def text_status():
     if not groups:
         return "*Status*\n\nKoi group nahi hai abhi.\nManage Groups se naya group banao!"
-    lines = ["*Status - All Groups*\n"]
+    lines = ["*Status — All Groups*\n"]
     for gid, g in groups.items():
         status    = "🟢 Running" if g["active"] else "🔴 Stopped"
-        in_names  = ", ".join(get_dname(d) for d in g["incoming"])  or "-"
-        out_names = ", ".join(get_dname(d) for d in g["outgoing"]) or "-"
+        in_names  = ", ".join(get_dname(d) for d in g["incoming"])  or "—"
+        out_names = ", ".join(get_dname(d) for d in g["outgoing"]) or "—"
         lines.append(f"*{g['name']}* — {status}")
         lines.append(f"  IN:  {in_names}")
         lines.append(f"  OUT: {out_names}\n")
     return "\n".join(lines)
 
 
-def text_group(gid):
+def text_group(gid: int):
     g = groups.get(gid)
     if not g:
         return "Group nahi mila!"
     status   = "🟢 Running" if g["active"] else "🔴 Stopped"
-    in_list  = "\n  ".join(f"- {get_dname(d)}" for d in g["incoming"])  or "  -"
-    out_list = "\n  ".join(f"- {get_dname(d)}" for d in g["outgoing"]) or "  -"
+    in_list  = "\n  ".join(f"- {get_dname(d)}" for d in g["incoming"])  or "  —"
+    out_list = "\n  ".join(f"- {get_dname(d)}" for d in g["outgoing"]) or "  —"
     return (
         f"*{g['name']}*\n\n"
         f"Status: {status}\n\n"
         f"Incoming ({len(g['incoming'])}):\n  {in_list}\n\n"
         f"Outgoing ({len(g['outgoing'])}):\n  {out_list}"
+    )
+
+
+def text_settings(gid: int):
+    g = groups.get(gid, {})
+    kws   = ", ".join(sorted(g.get("keywords", [])))   or "—"
+    bl    = ", ".join(sorted(g.get("blacklist", [])))   or "—"
+    rep   = "\n  ".join(f"{o} → {n}" for o, n in g.get("replacements", {}).items()) or "—"
+    cap   = g.get("caption_mode", "keep")
+    ctxt  = g.get("caption_text", "") or "—"
+    return (
+        f"*⚙️ Settings — {g.get('name', '')}*\n\n"
+        f"🔍 *Keywords (whitelist):* {kws}\n"
+        f"🚫 *Blacklist:* {bl}\n"
+        f"✏️ *Replacements:*\n  {rep}\n"
+        f"📝 *Caption mode:* `{cap}`"
+        + (f"\n  Text: {ctxt}" if cap == "add" else "")
     )
 
 
@@ -374,158 +352,106 @@ async def cmd_start(msg: types.Message):
     if not is_owner(msg.from_user.id):
         await msg.answer("Access denied.")
         return
-    logged_in = await is_logged_in()
-    if not logged_in:
+    if not await is_logged_in():
         await msg.answer(
-            "*DealsKoti Forward Bot*\n\n"
-            "Pehle apne Telegram account se login karo.\n"
-            "Login button dabao:",
-            parse_mode="Markdown",
-            reply_markup=kb_login(),
+            "*DealsKoti Forward Bot*\n\nPehle login karo:",
+            parse_mode="Markdown", reply_markup=kb_login(),
         )
         return
-    text = (
-        "*Welcome to DealsKoti Bot!*\n\n"
-        "Messages automatically forward karo — bina Forwarded tag ke.\n"
-        "Private/restricted channels bhi supported.\n\n"
+    await msg.answer(
+        "*Welcome to DealsKoti Forward Bot!*\n\n"
+        "Messages automatically forward karo — bina Forwarded tag ke.\n\n"
         "*Quick Guide:*\n"
-        "1. Manage Groups > New Group\n"
+        "1. Manage Groups → New Group\n"
         "2. Incoming Channel set karo\n"
         "3. Outgoing Channel set karo\n"
-        "4. Start karo!\n\n"
-        "Neeche se option choose karo:"
+        "4. Start karo!",
+        parse_mode="Markdown", reply_markup=kb_main(),
     )
-    await msg.answer(text, parse_mode="Markdown", reply_markup=kb_main())
 
 
 @dp.message_handler(commands=["login"])
 async def cmd_login(msg: types.Message):
-    if not is_owner(msg.from_user.id):
-        await msg.answer("Access denied.")
-        return
+    if not is_owner(msg.from_user.id): return
     if await is_logged_in():
-        await msg.answer("Pehle se logged in ho! /start karo.")
+        await msg.answer("Pehle se logged in ho!")
         return
     login_state["step"] = "phone"
-    await msg.answer(
-        "Apna Telegram phone number dalo (country code ke saath):\n"
-        "Example: +919876543210"
-    )
+    await msg.answer("Apna phone number dalo (+919876543210):")
 
 
 @dp.message_handler(commands=["logout"])
 async def cmd_logout(msg: types.Message):
-    if not is_owner(msg.from_user.id):
-        await msg.answer("Access denied.")
-        return
+    if not is_owner(msg.from_user.id): return
     try:
         await client.log_out()
     except Exception:
         pass
     login_state.update(step=None, phone=None, phone_hash=None)
-    await msg.answer("Logout ho gaye. /login karke dobara login karo.")
-
-
-@dp.message_handler(commands=["help"])
-async def cmd_help(msg: types.Message):
-    if not is_owner(msg.from_user.id):
-        await msg.answer("Access denied.")
-        return
-    text = (
-        "*Help — DealsKoti Forward Bot*\n\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "*Login (Pehli baar):*\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "1. /login bhejo\n"
-        "2. Phone number dalo (+91...)\n"
-        "3. OTP dalo\n"
-        "4. 2FA password (agar laga ho)\n"
-        "5. Done!\n\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "*Forwarding Setup:*\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "1. Manage Groups > New Group banao\n"
-        "2. Incoming channel select > Confirm\n"
-        "3. Outgoing channel select > Confirm\n"
-        "4. Start karo!\n\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "*Commands:*\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "/start — Main menu\n"
-        "/login — Login karo\n"
-        "/logout — Logout karo\n"
-        "/groups — Groups manage karo\n"
-        "/status — Status dekho\n"
-        "/startall — Sab groups start\n"
-        "/stopall — Sab groups stop\n"
-        "/help — Yahi message\n\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "*Features:*\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        f"- Max {MAX_GROUPS} groups\n"
-        "- Multiple incoming/outgoing per group\n"
-        "- Bina 'Forwarded' tag ke forward\n"
-        "- Private & restricted channels support\n"
-        "- Link wale messages zaroor forward hote hain\n"
-        "- Groups/settings restart ke baad bhi save rehte hain"
-    )
-    await msg.answer(text, parse_mode="Markdown")
-
-
-@dp.message_handler(commands=["groups"])
-async def cmd_groups(msg: types.Message):
-    if not is_owner(msg.from_user.id):
-        await msg.answer("Access denied.")
-        return
-    if not groups:
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("+ New Group", callback_data="ng"))
-        await msg.answer("Koi group nahi hai.", reply_markup=kb)
-        return
-    await msg.answer("*Saare Groups:*", parse_mode="Markdown", reply_markup=kb_groups())
+    await msg.answer("Logout ho gaye. /login se dobara login karo.")
 
 
 @dp.message_handler(commands=["status"])
 async def cmd_status(msg: types.Message):
-    if not is_owner(msg.from_user.id):
-        await msg.answer("Access denied.")
-        return
+    if not is_owner(msg.from_user.id): return
     await msg.answer(text_status(), parse_mode="Markdown", reply_markup=kb_status())
 
 
 @dp.message_handler(commands=["startall"])
 async def cmd_startall(msg: types.Message):
-    if not is_owner(msg.from_user.id):
-        await msg.answer("Access denied.")
-        return
+    if not is_owner(msg.from_user.id): return
     count = 0
     for g in groups.values():
         if g["incoming"] and g["outgoing"]:
             g["active"] = True
+            await storage.set_group_active(g["id"], True)
             count += 1
-    save_groups()
-    await msg.answer(f"{count} group(s) start ho gaye!")
+    await msg.answer(f"✅ {count} group(s) start ho gaye!")
 
 
 @dp.message_handler(commands=["stopall"])
 async def cmd_stopall(msg: types.Message):
-    if not is_owner(msg.from_user.id):
-        await msg.answer("Access denied.")
-        return
+    if not is_owner(msg.from_user.id): return
     for g in groups.values():
         g["active"] = False
-    save_groups()
-    await msg.answer("Sab groups band ho gaye!")
+        await storage.set_group_active(g["id"], False)
+    await msg.answer("⏹ Sab groups band ho gaye!")
+
+
+@dp.message_handler(commands=["help"])
+async def cmd_help(msg: types.Message):
+    if not is_owner(msg.from_user.id): return
+    text = (
+        "*Help — DealsKoti Forward Bot*\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "*Login:*\n"
+        "1. /login → phone → OTP → (2FA if needed)\n\n"
+        "*Forwarding Setup:*\n"
+        "1. Manage Groups → New Group\n"
+        "2. Incoming set → Confirm\n"
+        "3. Outgoing set → Confirm\n"
+        "4. Start!\n\n"
+        "*Per-Group Settings (⚙️ button):*\n"
+        "- 🔍 Keyword Filter — sirf matching messages forward\n"
+        "- 🚫 Blacklist — matching words wale messages skip\n"
+        "- ✏️ Word Replace — text badlo before forwarding\n"
+        "- 📝 Caption — add/remove/keep caption\n\n"
+        "*Live Edit Sync:*\n"
+        "Source channel ne message edit kiya → target mein bhi auto-edit ✅\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"Max {MAX_GROUPS} groups.\n"
+        "/startall /stopall se sab control."
+    )
+    await msg.answer(text, parse_mode="Markdown")
 
 
 # ====================================================================
-# TEXT HANDLER  (login flow + rename)
+# TEXT HANDLER  (login flow + rename + settings input)
 # ====================================================================
 
 @dp.message_handler()
 async def text_handler(msg: types.Message):
-    if not is_owner(msg.from_user.id):
-        return
+    if not is_owner(msg.from_user.id): return
 
     uid  = msg.from_user.id
     text = msg.text.strip() if msg.text else ""
@@ -537,11 +463,7 @@ async def text_handler(msg: types.Message):
             login_state["phone"]      = text
             login_state["phone_hash"] = result.phone_code_hash
             login_state["step"]       = "otp"
-            await msg.answer(
-                "OTP Telegram pe bhej diya!\n\n"
-                "Ab OTP enter karo (sirf numbers):\n"
-                "Example: 12345"
-            )
+            await msg.answer("OTP bhej diya! Ab OTP dalo (sirf numbers):")
         except Exception as e:
             login_state["step"] = None
             await msg.answer(f"Error: {e}\n\nDobara /login karo.")
@@ -558,13 +480,13 @@ async def text_handler(msg: types.Message):
             )
             login_state["step"] = None
             await load_dialogs()
-            await msg.answer("Login ho gaye! Ab /start karo.")
+            await msg.answer("✅ Login ho gaye! Ab /start karo.")
         except SessionPasswordNeededError:
             login_state["step"] = "2fa"
-            await msg.answer("2-Step Verification ON hai.\nApna password dalo:")
+            await msg.answer("2FA ON hai. Password dalo:")
         except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
             login_state["step"] = None
-            await msg.answer(f"OTP galat/expire: {e}\n\nDobara /login karo.")
+            await msg.answer(f"OTP galat/expired: {e}\n\nDobara /login karo.")
         except Exception as e:
             login_state["step"] = None
             await msg.answer(f"Error: {e}\n\nDobara /login karo.")
@@ -576,31 +498,72 @@ async def text_handler(msg: types.Message):
             await client.sign_in(password=text)
             login_state["step"] = None
             await load_dialogs()
-            await msg.answer("Login ho gaye! Ab /start karo.")
+            await msg.answer("✅ Login ho gaye! Ab /start karo.")
         except PasswordHashInvalidError:
-            await msg.answer("Password galat hai. Dobara dalo:")
+            await msg.answer("Password galat. Dobara dalo:")
         except Exception as e:
             login_state["step"] = None
             await msg.answer(f"Error: {e}\n\nDobara /login karo.")
         return
 
-    # ---- RENAME ----
+    # ---- USER STATE ACTIONS ----
     state = user_state.get(uid)
-    if state and state.get("action") == "rename":
-        gid = state["group_id"]
-        if gid in groups:
-            new_name = text[:30]
-            groups[gid]["name"] = new_name
-            save_groups()
-            del user_state[uid]
-            await msg.answer(
-                f"Naam badal diya: *{new_name}*",
-                parse_mode="Markdown",
-                reply_markup=kb_group(gid),
-            )
+    if not state:
+        return
+    action = state.get("action")
+    gid    = state.get("group_id")
+
+    # Rename group
+    if action == "rename" and gid in groups:
+        new_name = text[:30]
+        groups[gid]["name"] = new_name
+        await storage.rename_group(gid, new_name)
+        del user_state[uid]
+        await msg.answer(f"✅ Naam badla: *{new_name}*", parse_mode="Markdown",
+                         reply_markup=kb_group(gid))
+
+    # Add keyword
+    elif action == "add_keyword" and gid in groups:
+        words = [w.strip() for w in text.split(",") if w.strip()]
+        groups[gid]["keywords"].update(words)
+        await storage.update_group_settings(gid, keywords=groups[gid]["keywords"])
+        del user_state[uid]
+        await msg.answer(f"✅ Keywords add hue: {', '.join(words)}",
+                         reply_markup=kb_keyword(gid))
+
+    # Add blacklist word
+    elif action == "add_blacklist" and gid in groups:
+        words = [w.strip() for w in text.split(",") if w.strip()]
+        groups[gid]["blacklist"].update(words)
+        await storage.update_group_settings(gid, blacklist=groups[gid]["blacklist"])
+        del user_state[uid]
+        await msg.answer(f"✅ Blacklist mein add hue: {', '.join(words)}",
+                         reply_markup=kb_blacklist(gid))
+
+    # Add replacement rule  (format: "old text | new text")
+    elif action == "add_replace" and gid in groups:
+        if "|" in text:
+            old, new = text.split("|", 1)
+            old, new = old.strip(), new.strip()
+            if old:
+                groups[gid]["replacements"][old] = new
+                await storage.update_group_settings(gid, replacements=groups[gid]["replacements"])
+                del user_state[uid]
+                await msg.answer(f"✅ Rule add hua:\n`{old}` → `{new}`",
+                                 parse_mode="Markdown", reply_markup=kb_replace(gid))
+            else:
+                await msg.answer("❌ Format galat. Example:\n`Amazon | My Store`",
+                                 parse_mode="Markdown")
         else:
-            del user_state[uid]
-            await msg.answer("Group nahi mila.")
+            await msg.answer("❌ Format: `purana text | naya text`\nExample:\n`Amazon | My Store`",
+                             parse_mode="Markdown")
+
+    # Set caption text
+    elif action == "set_caption_text" and gid in groups:
+        groups[gid]["caption_text"] = text
+        await storage.update_group_settings(gid, caption_text=text)
+        del user_state[uid]
+        await msg.answer(f"✅ Caption text set hua:\n{text}", reply_markup=kb_caption(gid))
 
 
 # ====================================================================
@@ -619,17 +582,13 @@ async def on_callback(cb: types.CallbackQuery):
     # ---- Login ----
     if data == "do_login":
         if await is_logged_in():
-            await cb.message.edit_text("Pehle se logged in ho! /start karo.")
+            await cb.message.edit_text("Pehle se logged in ho!")
             return
         login_state["step"] = "phone"
-        await cb.message.edit_text(
-            "Apna phone number dalo (country code ke saath):\n"
-            "Example: +919876543210"
-        )
+        await cb.message.edit_text("Phone number dalo (+91...):")
         await cb.answer()
         return
 
-    # ---- Sab actions ke liye login check ----
     if not await is_logged_in():
         await cb.answer("Pehle /login karo!", show_alert=True)
         return
@@ -638,8 +597,7 @@ async def on_callback(cb: types.CallbackQuery):
     if data == "mm":
         await cb.message.edit_text(
             "*DealsKoti Forward Bot*\n\nOption choose karo:",
-            parse_mode="Markdown",
-            reply_markup=kb_main(),
+            parse_mode="Markdown", reply_markup=kb_main(),
         )
 
     elif data == "dm":
@@ -649,442 +607,408 @@ async def on_callback(cb: types.CallbackQuery):
         await cb.message.answer(text_status(), parse_mode="Markdown", reply_markup=kb_status())
 
     elif data == "hl":
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("Main Menu", callback_data="mm"))
         await cb.message.answer(
-            "*Help*\n\n"
-            "1. Manage Groups > New Group\n"
-            "2. Incoming select > Confirm\n"
-            "3. Outgoing select > Confirm\n"
-            "4. Start karo!\n\n"
-            f"Max {MAX_GROUPS} groups.\n"
-            "Bina Forwarded tag ke forward.\n"
-            "Link wale messages zaroor forward.\n"
-            "/startall /stopall se sab control.",
-            parse_mode="Markdown",
-            reply_markup=kb,
+            "Dekho /help command — full guide wahan hai.",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("🏠 Main Menu", callback_data="mm")
+            )
         )
-
-    # ---- Groups list ----
-    elif data == "grp_list":
-        if not groups:
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("+ New Group", callback_data="ng"))
-            kb.add(InlineKeyboardButton("Main Menu",   callback_data="mm"))
-            await cb.message.edit_text(
-                "*Groups*\n\nKoi group nahi hai. Naya banao!",
-                parse_mode="Markdown",
-                reply_markup=kb,
-            )
-        else:
-            await cb.message.edit_text(
-                "*Saare Groups*\n\nGroup select karo ya naya banao:",
-                parse_mode="Markdown",
-                reply_markup=kb_groups(),
-            )
-
-    # ---- New Group ----
-    elif data == "ng":
-        nid = next_gid()
-        if not nid:
-            await cb.answer(f"Max {MAX_GROUPS} groups bana sakte ho!", show_alert=True)
-            return
-        groups[nid] = {
-            "name":     f"Group {nid}",
-            "incoming": set(),
-            "outgoing": set(),
-            "active":   False,
-        }
-        save_groups()
-        await cb.message.edit_text(
-            f"*{groups[nid]['name']}* bana diya!\n\nAb incoming aur outgoing channels set karo.",
-            parse_mode="Markdown",
-            reply_markup=kb_group(nid),
-        )
-
-    # ---- Group detail ----
-    elif data.startswith("grp:"):
-        gid = int(data[4:])
-        if gid not in groups:
-            await cb.answer("Group nahi mila!", show_alert=True)
-            return
-        await cb.message.edit_text(
-            text_group(gid), parse_mode="Markdown", reply_markup=kb_group(gid)
-        )
-
-    # ---- Incoming channel list ----
-    elif data.startswith("gi:"):
-        gid = int(data[3:])
-        if gid not in groups:
-            await cb.answer("Group nahi mila!", show_alert=True)
-            return
-        await load_dialogs()
-        if not all_dialogs:
-            await cb.answer("Koi channel nahi mila! Pehle /login karo.", show_alert=True)
-            return
-        await cb.message.edit_text(
-            f"{groups[gid]['name']} — Incoming\nNumber dabao to select/deselect:\n\n"
-            + text_channel_list(gid, "in"),
-            reply_markup=kb_channels(gid, "in"),
-        )
-
-    # ---- Outgoing channel list ----
-    elif data.startswith("go:"):
-        gid = int(data[3:])
-        if gid not in groups:
-            await cb.answer("Group nahi mila!", show_alert=True)
-            return
-        await load_dialogs()
-        if not all_dialogs:
-            await cb.answer("Koi channel nahi mila! Pehle /login karo.", show_alert=True)
-            return
-        await cb.message.edit_text(
-            f"{groups[gid]['name']} — Outgoing\nNumber dabao to select/deselect:\n\n"
-            + text_channel_list(gid, "out"),
-            reply_markup=kb_channels(gid, "out"),
-        )
-
-    # ---- Toggle incoming channel ----
-    elif data.startswith("si:"):
-        parts = data.split(":")
-        idx, gid = int(parts[1]), int(parts[2])
-        d = get_dialog(idx)
-        if d and gid in groups:
-            did = d[0]
-            s   = groups[gid]["incoming"]
-            s.discard(did) if did in s else s.add(did)
-            save_groups()
-            await cb.message.edit_text(
-                f"{groups[gid]['name']} — Incoming\nNumber dabao to select/deselect:\n\n"
-                + text_channel_list(gid, "in"),
-                reply_markup=kb_channels(gid, "in"),
-            )
-
-    # ---- Toggle outgoing channel ----
-    elif data.startswith("to:"):
-        parts = data.split(":")
-        idx, gid = int(parts[1]), int(parts[2])
-        d = get_dialog(idx)
-        if d and gid in groups:
-            did = d[0]
-            s   = groups[gid]["outgoing"]
-            s.discard(did) if did in s else s.add(did)
-            save_groups()
-            await cb.message.edit_text(
-                f"{groups[gid]['name']} — Outgoing\nNumber dabao to select/deselect:\n\n"
-                + text_channel_list(gid, "out"),
-                reply_markup=kb_channels(gid, "out"),
-            )
-
-    # ---- Select All / Clear All incoming ----
-    elif data.startswith("sia:"):
-        gid = int(data[4:])
-        if gid in groups:
-            for did, _ in all_dialogs:
-                groups[gid]["incoming"].add(did)
-            save_groups()
-            await cb.message.edit_text(
-                f"{groups[gid]['name']} — Incoming\n\n" + text_channel_list(gid, "in"),
-                reply_markup=kb_channels(gid, "in"),
-            )
-
-    elif data.startswith("sic:"):
-        gid = int(data[4:])
-        if gid in groups:
-            groups[gid]["incoming"].clear()
-            save_groups()
-            await cb.message.edit_text(
-                f"{groups[gid]['name']} — Incoming\n\n" + text_channel_list(gid, "in"),
-                reply_markup=kb_channels(gid, "in"),
-            )
-
-    # ---- Select All / Clear All outgoing ----
-    elif data.startswith("toa:"):
-        gid = int(data[4:])
-        if gid in groups:
-            for did, _ in all_dialogs:
-                groups[gid]["outgoing"].add(did)
-            save_groups()
-            await cb.message.edit_text(
-                f"{groups[gid]['name']} — Outgoing\n\n" + text_channel_list(gid, "out"),
-                reply_markup=kb_channels(gid, "out"),
-            )
-
-    elif data.startswith("toc:"):
-        gid = int(data[4:])
-        if gid in groups:
-            groups[gid]["outgoing"].clear()
-            save_groups()
-            await cb.message.edit_text(
-                f"{groups[gid]['name']} — Outgoing\n\n" + text_channel_list(gid, "out"),
-                reply_markup=kb_channels(gid, "out"),
-            )
-
-    # ---- Confirm incoming ----
-    elif data.startswith("gc:"):
-        gid = int(data[3:])
-        if gid in groups:
-            count = len(groups[gid]["incoming"])
-            if count == 0:
-                await cb.answer("Koi channel select nahi kiya!", show_alert=True)
-                return
-            names = "\n".join(f"- {get_dname(d)}" for d in groups[gid]["incoming"])
-            await cb.message.edit_text(
-                f"*Incoming Confirmed!*\n\n{count} channel(s) set:\n{names}\n\n"
-                "Ab outgoing channel set karo.",
-                parse_mode="Markdown",
-                reply_markup=kb_after_incoming(gid),
-            )
-
-    # ---- Confirm outgoing ----
-    elif data.startswith("gco:"):
-        gid = int(data[4:])
-        if gid in groups:
-            count = len(groups[gid]["outgoing"])
-            if count == 0:
-                await cb.answer("Koi channel select nahi kiya!", show_alert=True)
-                return
-            names = "\n".join(f"- {get_dname(d)}" for d in groups[gid]["outgoing"])
-            await cb.message.edit_text(
-                f"*Outgoing Confirmed!*\n\n{count} channel(s) set:\n{names}\n\n"
-                "Ab forwarding start karo!",
-                parse_mode="Markdown",
-                reply_markup=kb_after_outgoing(gid),
-            )
-
-    # ---- Start group ----
-    elif data.startswith("gs:"):
-        gid = int(data[3:])
-        if gid in groups:
-            g = groups[gid]
-            if not g["incoming"]:
-                await cb.answer("Pehle incoming channel set karo!", show_alert=True)
-                return
-            if not g["outgoing"]:
-                await cb.answer("Pehle outgoing channel set karo!", show_alert=True)
-                return
-            g["active"] = True
-            save_groups()
-            in_names  = ", ".join(get_dname(d) for d in g["incoming"])
-            out_names = ", ".join(get_dname(d) for d in g["outgoing"])
-            await cb.message.edit_text(
-                f"*Forwarding Started!*\n\n{g['name']}\n"
-                f"From: {in_names}\nTo: {out_names}\n\n"
-                "Messages forward ho rahe hain!",
-                parse_mode="Markdown",
-                reply_markup=kb_after_start(gid),
-            )
-
-    # ---- Stop group ----
-    elif data.startswith("gx:"):
-        gid = int(data[3:])
-        if gid in groups:
-            groups[gid]["active"] = False
-            save_groups()
-            await cb.message.edit_text(
-                f"*{groups[gid]['name']}* band ho gaya!",
-                parse_mode="Markdown",
-                reply_markup=kb_group(gid),
-            )
-
-    # ---- Rename group ----
-    elif data.startswith("gr:"):
-        gid = int(data[3:])
-        if gid in groups:
-            user_state[uid] = {"action": "rename", "group_id": gid}
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("Cancel", callback_data=f"grp:{gid}"))
-            await cb.message.edit_text(
-                f"*{groups[gid]['name']}* ka naya naam type karo (max 30 chars):",
-                parse_mode="Markdown",
-                reply_markup=kb,
-            )
-
-    # ---- Delete group (confirm) ----
-    elif data.startswith("gd:"):
-        gid = int(data[3:])
-        if gid in groups:
-            await cb.message.edit_text(
-                f"*'{groups[gid]['name']}'* delete karna chahte ho?\n\nYe undo nahi hogi!",
-                parse_mode="Markdown",
-                reply_markup=kb_delete_confirm(gid),
-            )
-
-    # ---- Delete group (confirmed) ----
-    elif data.startswith("gdf:"):
-        gid = int(data[4:])
-        if gid in groups:
-            name = groups[gid]["name"]
-            del groups[gid]
-            save_groups()
-            kb = InlineKeyboardMarkup(row_width=2)
-            kb.add(
-                InlineKeyboardButton("Groups",    callback_data="grp_list"),
-                InlineKeyboardButton("Main Menu", callback_data="mm"),
-            )
-            await cb.message.edit_text(
-                f"*'{name}'* delete ho gaya!",
-                parse_mode="Markdown",
-                reply_markup=kb,
-            )
 
     # ---- Start All / Stop All ----
     elif data == "sa":
-        count = sum(1 for g in groups.values() if g["incoming"] and g["outgoing"] and not g["active"])
-        for g in groups.values():
-            if g["incoming"] and g["outgoing"]:
-                g["active"] = True
-        save_groups()
-        await cb.answer(f"Sab groups start ho gaye!", show_alert=True)
-
-    elif data == "xa":
-        for g in groups.values():
-            g["active"] = False
-        save_groups()
-        await cb.answer("Sab groups band ho gaye!", show_alert=True)
-
-    # ---- Quick Start / Stop ----
-    elif data == "quick_start":
         count = 0
         for g in groups.values():
             if g["incoming"] and g["outgoing"]:
                 g["active"] = True
+                await storage.set_group_active(g["id"], True)
                 count += 1
-        if count == 0:
-            await cb.answer("Koi configured group nahi! Pehle setup karo.", show_alert=True)
-        else:
-            save_groups()
-            await cb.answer(f"{count} group(s) start ho gaye!", show_alert=True)
+        await cb.message.edit_text(
+            f"✅ {count} group(s) start ho gaye!", reply_markup=kb_status()
+        )
 
-    elif data == "quick_stop":
+    elif data == "xa":
         for g in groups.values():
             g["active"] = False
-        save_groups()
-        await cb.answer("Sab forwarding band ho gaya!", show_alert=True)
+            await storage.set_group_active(g["id"], False)
+        await cb.message.edit_text("⏹ Sab groups band ho gaye!", reply_markup=kb_status())
 
-    # ---- Incoming shortcut from main menu ----
-    elif data == "menu_inc":
+    # ---- Groups List ----
+    elif data == "grp_list":
         if not groups:
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("+ New Group", callback_data="ng"))
-            kb.add(InlineKeyboardButton("Main Menu",   callback_data="mm"))
-            await cb.message.edit_text("Pehle ek group banao:", reply_markup=kb)
-        elif len(groups) == 1:
-            gid = list(groups.keys())[0]
-            await load_dialogs()
+            kb.add(InlineKeyboardButton("➕ New Group", callback_data="ng"))
+            kb.add(InlineKeyboardButton("🏠 Main Menu",  callback_data="mm"))
             await cb.message.edit_text(
-                f"{groups[gid]['name']} — Incoming\nSelect karo:",
-                reply_markup=kb_channels(gid, "in"),
+                "*Groups*\n\nKoi group nahi hai. Naya banao!",
+                parse_mode="Markdown", reply_markup=kb,
             )
         else:
-            kb = InlineKeyboardMarkup(row_width=1)
-            for gid, g in groups.items():
-                kb.add(InlineKeyboardButton(g["name"], callback_data=f"gi:{gid}"))
-            kb.add(InlineKeyboardButton("Main Menu", callback_data="mm"))
-            await cb.message.edit_text("Kaun se group ka incoming set karna hai?", reply_markup=kb)
+            await cb.message.edit_text(
+                "*Saare Groups*", parse_mode="Markdown", reply_markup=kb_groups()
+            )
 
-    # ---- Outgoing shortcut from main menu ----
-    elif data == "menu_out":
-        if not groups:
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("+ New Group", callback_data="ng"))
-            kb.add(InlineKeyboardButton("Main Menu",   callback_data="mm"))
-            await cb.message.edit_text("Pehle ek group banao:", reply_markup=kb)
-        elif len(groups) == 1:
-            gid = list(groups.keys())[0]
-            await load_dialogs()
-            await cb.message.edit_text(
-                f"{groups[gid]['name']} — Outgoing\nSelect karo:",
-                reply_markup=kb_channels(gid, "out"),
-            )
+    # ---- New Group ----
+    elif data == "ng":
+        if await storage.count_groups() >= MAX_GROUPS:
+            await cb.answer(f"Max {MAX_GROUPS} groups!", show_alert=True)
+            return
+        g = await storage.create_group(f"Group {len(groups)+1}")
+        g["incoming"] = set()
+        g["outgoing"] = set()
+        groups[g["id"]] = g
+        await cb.message.edit_text(
+            f"*{g['name']}* bana diya! Incoming/Outgoing set karo.",
+            parse_mode="Markdown", reply_markup=kb_group(g["id"]),
+        )
+
+    # ---- Group Detail ----
+    elif data.startswith("grp:"):
+        gid = int(data[4:])
+        if gid not in groups:
+            await cb.answer("Group nahi mila!", show_alert=True); return
+        await cb.message.edit_text(
+            text_group(gid), parse_mode="Markdown", reply_markup=kb_group(gid)
+        )
+
+    # ---- Start / Stop single group ----
+    elif data.startswith("gs:"):
+        gid = int(data[3:])
+        if gid not in groups:
+            await cb.answer("Group nahi mila!", show_alert=True); return
+        g = groups[gid]
+        if not g["incoming"] or not g["outgoing"]:
+            await cb.answer("Pehle incoming aur outgoing set karo!", show_alert=True); return
+        g["active"] = True
+        await storage.set_group_active(gid, True)
+        await cb.message.edit_text(
+            text_group(gid), parse_mode="Markdown", reply_markup=kb_group(gid)
+        )
+
+    elif data.startswith("gx:"):
+        gid = int(data[3:])
+        if gid not in groups: return
+        groups[gid]["active"] = False
+        await storage.set_group_active(gid, False)
+        await cb.message.edit_text(
+            text_group(gid), parse_mode="Markdown", reply_markup=kb_group(gid)
+        )
+
+    # ---- Rename ----
+    elif data.startswith("rn:"):
+        gid = int(data[3:])
+        user_state[uid] = {"action": "rename", "group_id": gid}
+        await cb.message.edit_text("Naya naam bhejo:")
+
+    # ---- Delete ----
+    elif data.startswith("gd:"):
+        gid = int(data[3:])
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton("✅ Haan, Delete", callback_data=f"gdf:{gid}"),
+            InlineKeyboardButton("❌ Nahi",          callback_data=f"grp:{gid}"),
+        )
+        await cb.message.edit_text(
+            f"*{groups.get(gid, {}).get('name', '')}* delete karna chahte ho?",
+            parse_mode="Markdown", reply_markup=kb,
+        )
+
+    elif data.startswith("gdf:"):
+        gid = int(data[4:])
+        name = groups.get(gid, {}).get("name", "")
+        await storage.delete_group(gid)
+        groups.pop(gid, None)
+        await cb.message.edit_text(
+            f"🗑 *{name}* delete ho gaya.", parse_mode="Markdown", reply_markup=kb_groups()
+        )
+
+    # ---- Incoming Channel Selection ----
+    elif data.startswith("gi:"):
+        gid = int(data[3:])
+        if gid not in groups: return
+        await load_dialogs()
+        await cb.message.edit_text(
+            f"{groups[gid]['name']} — Incoming\nNumber dabao select/deselect:",
+            reply_markup=kb_channel_select(gid, "incoming"),
+        )
+
+    elif data.startswith("fr:"):
+        _, idx, gid = data.split(":")
+        gid, idx = int(gid), int(idx)
+        if gid not in groups or idx >= len(all_dialogs): return
+        did, _ = all_dialogs[idx]
+        if did in groups[gid]["incoming"]:
+            groups[gid]["incoming"].discard(did)
         else:
-            kb = InlineKeyboardMarkup(row_width=1)
-            for gid, g in groups.items():
-                kb.add(InlineKeyboardButton(g["name"], callback_data=f"go:{gid}"))
-            kb.add(InlineKeyboardButton("Main Menu", callback_data="mm"))
-            await cb.message.edit_text("Kaun se group ka outgoing set karna hai?", reply_markup=kb)
+            groups[gid]["incoming"].add(did)
+        await cb.message.edit_reply_markup(kb_channel_select(gid, "incoming"))
+
+    elif data.startswith("fia:"):
+        gid = int(data[4:])
+        groups[gid]["incoming"] = {d[0] for d in all_dialogs}
+        await cb.message.edit_reply_markup(kb_channel_select(gid, "incoming"))
+
+    elif data.startswith("fic:"):
+        gid = int(data[4:])
+        groups[gid]["incoming"] = set()
+        await cb.message.edit_reply_markup(kb_channel_select(gid, "incoming"))
+
+    elif data.startswith("gci:"):
+        gid = int(data[4:])
+        await storage.set_channels(gid, "incoming", groups[gid]["incoming"])
+        await cb.message.edit_text(
+            text_group(gid), parse_mode="Markdown", reply_markup=kb_group(gid)
+        )
+
+    # ---- Outgoing Channel Selection ----
+    elif data.startswith("go:"):
+        gid = int(data[3:])
+        if gid not in groups: return
+        await load_dialogs()
+        await cb.message.edit_text(
+            f"{groups[gid]['name']} — Outgoing\nNumber dabao select/deselect:",
+            reply_markup=kb_channel_select(gid, "outgoing"),
+        )
+
+    elif data.startswith("to:"):
+        _, idx, gid = data.split(":")
+        gid, idx = int(gid), int(idx)
+        if gid not in groups or idx >= len(all_dialogs): return
+        did, _ = all_dialogs[idx]
+        if did in groups[gid]["outgoing"]:
+            groups[gid]["outgoing"].discard(did)
+        else:
+            groups[gid]["outgoing"].add(did)
+        await cb.message.edit_reply_markup(kb_channel_select(gid, "outgoing"))
+
+    elif data.startswith("toa:"):
+        gid = int(data[4:])
+        groups[gid]["outgoing"] = {d[0] for d in all_dialogs}
+        await cb.message.edit_reply_markup(kb_channel_select(gid, "outgoing"))
+
+    elif data.startswith("toc:"):
+        gid = int(data[4:])
+        groups[gid]["outgoing"] = set()
+        await cb.message.edit_reply_markup(kb_channel_select(gid, "outgoing"))
+
+    elif data.startswith("gco:"):
+        gid = int(data[4:])
+        await storage.set_channels(gid, "outgoing", groups[gid]["outgoing"])
+        await cb.message.edit_text(
+            text_group(gid), parse_mode="Markdown", reply_markup=kb_group(gid)
+        )
+
+    # ====================================================================
+    # SETTINGS MENU
+    # ====================================================================
+
+    elif data.startswith("cfg:"):
+        gid = int(data[4:])
+        if gid not in groups: return
+        await cb.message.edit_text(
+            text_settings(gid), parse_mode="Markdown", reply_markup=kb_settings(gid)
+        )
+
+    # ---- Keyword Filter ----
+    elif data.startswith("kw:"):
+        gid = int(data[3:])
+        await cb.message.edit_text(
+            "*🔍 Keyword Filter*\n\nSirf in words wale messages forward honge.\n"
+            "Empty hai toh sab forward hoga.",
+            parse_mode="Markdown", reply_markup=kb_keyword(gid),
+        )
+
+    elif data.startswith("kwadd:"):
+        gid = int(data[6:])
+        user_state[uid] = {"action": "add_keyword", "group_id": gid}
+        await cb.message.edit_text(
+            "Keywords bhejo (comma se alag karo):\nExample: `deal, offer, sale`",
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("kwdel:"):
+        _, gid_str, kw = data.split(":", 2)
+        gid = int(gid_str)
+        groups[gid]["keywords"].discard(kw)
+        await storage.update_group_settings(gid, keywords=groups[gid]["keywords"])
+        await cb.message.edit_reply_markup(kb_keyword(gid))
+
+    # ---- Blacklist ----
+    elif data.startswith("bl:"):
+        gid = int(data[3:])
+        await cb.message.edit_text(
+            "*🚫 Blacklist*\n\nIn words wale messages skip ho jaayenge.",
+            parse_mode="Markdown", reply_markup=kb_blacklist(gid),
+        )
+
+    elif data.startswith("bladd:"):
+        gid = int(data[6:])
+        user_state[uid] = {"action": "add_blacklist", "group_id": gid}
+        await cb.message.edit_text(
+            "Blacklist words bhejo (comma se alag karo):\nExample: `spam, casino, bet`",
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("bldel:"):
+        _, gid_str, word = data.split(":", 2)
+        gid = int(gid_str)
+        groups[gid]["blacklist"].discard(word)
+        await storage.update_group_settings(gid, blacklist=groups[gid]["blacklist"])
+        await cb.message.edit_reply_markup(kb_blacklist(gid))
+
+    # ---- Word Replace ----
+    elif data.startswith("rp:"):
+        gid = int(data[3:])
+        await cb.message.edit_text(
+            "*✏️ Word Replace*\n\nForward hone se pehle text mein words badlo.",
+            parse_mode="Markdown", reply_markup=kb_replace(gid),
+        )
+
+    elif data.startswith("rpadd:"):
+        gid = int(data[6:])
+        user_state[uid] = {"action": "add_replace", "group_id": gid}
+        await cb.message.edit_text(
+            "Rule bhejo is format mein:\n`purana text | naya text`\n\nExample:\n`Amazon | My Store`",
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("rpdel:"):
+        _, gid_str, old = data.split(":", 2)
+        gid = int(gid_str)
+        groups[gid]["replacements"].pop(old, None)
+        await storage.update_group_settings(gid, replacements=groups[gid]["replacements"])
+        await cb.message.edit_reply_markup(kb_replace(gid))
+
+    # ---- Caption ----
+    elif data.startswith("cap:"):
+        gid = int(data[4:])
+        await cb.message.edit_text(
+            "*📝 Caption Settings*\n\n"
+            "• *Keep* — original caption raho\n"
+            "• *Add* — apna caption add karo\n"
+            "• *Remove* — caption hata do",
+            parse_mode="Markdown", reply_markup=kb_caption(gid),
+        )
+
+    elif data.startswith("capmode:"):
+        _, gid_str, mode = data.split(":", 2)
+        gid = int(gid_str)
+        groups[gid]["caption_mode"] = mode
+        await storage.update_group_settings(gid, caption_mode=mode)
+        await cb.message.edit_reply_markup(kb_caption(gid))
+
+    elif data.startswith("captext:"):
+        gid = int(data[8:])
+        user_state[uid] = {"action": "set_caption_text", "group_id": gid}
+        await cb.message.edit_text(
+            "Apna caption text bhejo (jo har forwarded message ke neeche add hoga):"
+        )
 
     await cb.answer()
 
 
 # ====================================================================
-# FORWARDER  —  ye main logic hai jahan messages forward hote hain
+# FORWARDER  (New Messages)
 # ====================================================================
 
-async def _copy_with_download(target_id, message):
-    """Restricted content ke liye: download karke fresh upload."""
-    buf = io.BytesIO()
-    await message.download_media(file=buf)
-    buf.seek(0)
-    fname = "file"
-    if message.file and message.file.name:
-        fname = message.file.name
-    buf.name = fname
-    await client.send_file(
-        target_id,
-        file=buf,
-        caption=message.message or "",
-        force_document=False,
-    )
+@client.on(events.NewMessage())
+async def on_new_message(event):
+    if not groups:
+        return
+    m = event.message
+    if not m:
+        return
 
+    src_chat = event.chat_id
 
-def _extract_text(message) -> str:
-    """Message se pure text ko nikalo (caption bhi)."""
-    parts = []
-    if message.message:
-        parts.append(message.message)
-    return " ".join(parts)
-
-
-@client.on(events.NewMessage)
-async def forwarder(event):
     for gid, g in groups.items():
         if not g["active"]:
             continue
-        if event.chat_id not in g["incoming"]:
+        if src_chat not in g["incoming"]:
             continue
 
-        m = event.message
+        raw_text = m.message or ""
 
-        # ---- Decide karo kya forward karna hai ----
-        # 1) Webpage preview (link ke saath preview card)
-        #    => Sirf text/link send karo (send_file nahi chalega webpage pe)
+        # ---- Apply filters ----
+        if not passes_filters(raw_text, g):
+            continue
+
+        # ---- Send to all outgoing channels ----
         if isinstance(m.media, MessageMediaWebPage):
-            text_content = clean_text_urls(_extract_text(m))
-            if not has_link(text_content):
-                # Agar link hi nahi toh skip
+            text_out = process_text(apply_replacements(raw_text, g), g)
+            if not has_link(text_out):
                 continue
             for tgt_id in g["outgoing"]:
                 try:
-                    await client.send_message(tgt_id, text_content, link_preview=True)
+                    sent = await client.send_message(tgt_id, text_out, link_preview=True)
+                    await storage.save_message_map(gid, src_chat, m.id, tgt_id, sent.id)
                 except Exception as err:
-                    print(f"Forward error [{g['name']}] webpage -> {tgt_id}: {err}")
+                    print(f"[{g['name']}] webpage forward error -> {tgt_id}: {err}")
 
-        # 2) Doosra media (photo, video, document, etc.)
         elif m.media:
-            clean_caption = clean_text_urls(m.message or "")
+            caption_out = process_media_caption(raw_text, g)
             for tgt_id in g["outgoing"]:
                 try:
-                    await client.send_file(
-                        tgt_id,
-                        file=m.media,
-                        caption=clean_caption,
-                    )
+                    sent = await client.send_file(tgt_id, file=m.media, caption=caption_out)
+                    await storage.save_message_map(gid, src_chat, m.id, tgt_id, sent.id)
                 except Exception as fast_err:
-                    print(f"[{g['name']}] Fast fail, downloading: {fast_err}")
+                    print(f"[{g['name']}] fast send failed, downloading: {fast_err}")
                     try:
-                        await _copy_with_download(tgt_id, m)
+                        sent = await _copy_with_download(tgt_id, m)
+                        if sent:
+                            await storage.save_message_map(gid, src_chat, m.id, tgt_id, sent.id)
                     except Exception as dl_err:
-                        print(f"Download also failed [{g['name']}]: {dl_err}")
+                        print(f"[{g['name']}] download also failed: {dl_err}")
 
-        # 3) Pure text message
-        elif m.message:
-            text_content = clean_text_urls(m.message)
+        elif raw_text:
+            text_out = process_text(raw_text, g)
             for tgt_id in g["outgoing"]:
                 try:
-                    await client.send_message(tgt_id, text_content)
+                    sent = await client.send_message(tgt_id, text_out)
+                    await storage.save_message_map(gid, src_chat, m.id, tgt_id, sent.id)
                 except Exception as err:
-                    print(f"Forward error [{g['name']}] text -> {tgt_id}: {err}")
+                    print(f"[{g['name']}] text forward error -> {tgt_id}: {err}")
+
+
+# ====================================================================
+# LIVE EDIT SYNC  ⭐
+# Source channel ne message edit kiya → target mein bhi auto-edit
+# ====================================================================
+
+@client.on(events.MessageEdited())
+async def on_message_edited(event):
+    m = event.message
+    if not m:
+        return
+
+    src_chat = event.chat_id
+
+    # Find all forwarded copies of this message
+    targets = await storage.get_mapped_targets(src_chat, m.id)
+    if not targets:
+        return
+
+    # Get the group for this source to apply filters/replacements
+    for row in targets:
+        gid         = row["group_id"]
+        tgt_chat    = row["target_chat_id"]
+        tgt_msg_id  = row["target_msg_id"]
+        g           = groups.get(gid)
+
+        if not g or not g["active"]:
+            continue
+
+        raw_text = m.message or ""
+
+        try:
+            if m.media and not isinstance(m.media, MessageMediaWebPage):
+                # For media messages, only edit caption
+                new_caption = process_media_caption(raw_text, g)
+                await client.edit_message(tgt_chat, tgt_msg_id, new_caption)
+            else:
+                new_text = process_text(raw_text, g)
+                await client.edit_message(tgt_chat, tgt_msg_id, new_text)
+        except Exception as err:
+            print(f"[LiveEdit] Edit failed for group {gid} -> {tgt_chat}/{tgt_msg_id}: {err}")
 
 
 # ====================================================================
@@ -1092,17 +1016,23 @@ async def forwarder(event):
 # ====================================================================
 
 async def on_startup(_dispatcher):
+    # Init DB
+    await storage.init_db()
+
+    # Load all groups from DB into memory
+    loaded = await storage.get_all_groups()
+    groups.update(loaded)
+    print(f"[Groups] {len(groups)} group(s) loaded from DB.")
+
+    # Connect Telethon
     await client.connect()
     if await client.is_user_authorized():
-        print("Already logged in — dialogs load ho rahe hain...")
+        print("Telethon: already logged in. Loading dialogs...")
         await load_dialogs()
-        # Settings Telegram Saved Messages se load karo
-        await async_load_groups()
-        print(f"DealsKoti Forward Bot ready! {len(all_dialogs)} dialogs loaded.")
-        print(f"{len(groups)} group(s) restored from Telegram.")
     else:
-        print("Not logged in. Bot se /login karo.")
-    print("Bot is running!")
+        print("Telethon: not logged in. Use /login.")
+
+    print("✅ DealsKoti Forward Bot ready!")
 
 
 if __name__ == "__main__":
