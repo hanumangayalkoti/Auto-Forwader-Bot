@@ -6,6 +6,21 @@ import json
 import asyncpg
 from config import DATABASE_URL
 
+
+def _to_dict(val) -> dict:
+    """Safely convert JSONB value to dict regardless of how asyncpg returns it."""
+    if not val:
+        return {}
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        try:
+            result = json.loads(val)
+            return result if isinstance(result, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
 _pool: asyncpg.Pool | None = None
 
 
@@ -250,7 +265,7 @@ def _row_to_group(row) -> dict:
         "outgoing":     set(),
         "keywords":     set(row["keywords"] or []),
         "blacklist":    set(row["blacklist"] or []),
-        "replacements": dict(row["replacements"] or {}),
+        "replacements": _to_dict(row["replacements"]),
         "caption_mode": row["caption_mode"] or "keep",
         "caption_text": row["caption_text"] or "",
     }
