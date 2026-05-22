@@ -122,6 +122,14 @@ def process_media_caption(caption: str, g: dict) -> str:
     return apply_caption(caption, g)
 
 
+def channel_list_text(group_name: str, direction: str) -> str:
+    """Numbered list of channels shown above the selection keyboard."""
+    lines = [f"*{group_name} — {direction}*", "Number dabao to select/deselect:\n"]
+    for i, (did, name) in enumerate(all_dialogs[:50], 1):
+        lines.append(f"`{i}.` {name}")
+    return "\n".join(lines)
+
+
 def has_link(text: str) -> bool:
     return bool(re.search(r"https?://|t\.me/", text or ""))
 
@@ -424,25 +432,112 @@ async def cmd_help(msg: types.Message):
     text = (
         "*Help — DealsKoti Forward Bot*\n\n"
         "━━━━━━━━━━━━━━━━\n"
-        "*Login:*\n"
-        "1. /login → phone → OTP → (2FA if needed)\n\n"
-        "*Forwarding Setup:*\n"
-        "1. Manage Groups → New Group\n"
-        "2. Incoming set → Confirm\n"
-        "3. Outgoing set → Confirm\n"
-        "4. Start!\n\n"
-        "*Per-Group Settings (⚙️ button):*\n"
-        "- 🔍 Keyword Filter — sirf matching messages forward\n"
-        "- 🚫 Blacklist — matching words wale messages skip\n"
-        "- ✏️ Word Replace — text badlo before forwarding\n"
-        "- 📝 Caption — add/remove/keep caption\n\n"
-        "*Live Edit Sync:*\n"
-        "Source channel ne message edit kiya → target mein bhi auto-edit ✅\n\n"
+        "*🔑 Login (pehli baar):*\n"
+        "/login → phone → OTP → (2FA if needed)\n\n"
         "━━━━━━━━━━━━━━━━\n"
-        f"Max {MAX_GROUPS} groups.\n"
-        "/startall /stopall se sab control."
+        "*📋 Forwarding Setup:*\n"
+        "1. /start → Manage Groups → New Group\n"
+        "2. Incoming channel set karo → Confirm\n"
+        "3. Outgoing channel set karo → Confirm\n"
+        "4. Start!\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "*⚙️ Per-Group Settings:*\n"
+        "Group → ⚙️ Settings button se manage karo\n\n"
+        "🔍 *Keyword Filter* — `/filter`\n"
+        "Sirf specific words wale messages forward honge\n\n"
+        "🚫 *Blacklist* — `/blacklist`\n"
+        "In words wale messages skip ho jaayenge\n\n"
+        "✏️ *Word Replace* — `/replace`\n"
+        "Forward se pehle text mein words badlo\n"
+        "Format: `purana | naya`\n\n"
+        "📝 *Caption* — `/caption`\n"
+        "Keep / Add / Remove caption control karo\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "*⭐ Live Edit Sync:*\n"
+        "Source channel ne message edit kiya → target mein bhi auto-edit!\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "*All Commands:*\n"
+        "/start — 🏠 Main menu\n"
+        "/login — 🔑 Login karo\n"
+        "/logout — 🚪 Logout karo\n"
+        "/status — 📊 Groups ka status\n"
+        "/startall — ▶️ Sab groups start\n"
+        "/stopall — ⏹ Sab groups stop\n"
+        "/filter — 🔍 Keyword filter manage karo\n"
+        "/blacklist — 🚫 Blacklist manage karo\n"
+        "/replace — ✏️ Word replace rules manage karo\n"
+        "/caption — 📝 Caption settings manage karo\n"
+        "/help — ❓ Yahi message\n\n"
+        f"Max {MAX_GROUPS} groups supported."
     )
     await msg.answer(text, parse_mode="Markdown")
+
+
+def _group_selection_kb(callback_prefix: str) -> InlineKeyboardMarkup:
+    """Show all groups as buttons for command-based group selection."""
+    kb = InlineKeyboardMarkup(row_width=2)
+    if not groups:
+        kb.add(InlineKeyboardButton("➕ Pehle group banao", callback_data="grp_list"))
+        return kb
+    for gid, g in groups.items():
+        kb.add(InlineKeyboardButton(g["name"], callback_data=f"{callback_prefix}:{gid}"))
+    return kb
+
+
+@dp.message_handler(commands=["filter"])
+async def cmd_filter(msg: types.Message):
+    if not is_owner(msg.from_user.id): return
+    if not await is_logged_in():
+        await msg.answer("Pehle /login karo!"); return
+    if not groups:
+        await msg.answer("Koi group nahi hai. Pehle /start se group banao."); return
+    await msg.answer(
+        "*🔍 Keyword Filter*\nKaunse group ka filter manage karna hai?",
+        parse_mode="Markdown",
+        reply_markup=_group_selection_kb("kw"),
+    )
+
+
+@dp.message_handler(commands=["blacklist"])
+async def cmd_blacklist(msg: types.Message):
+    if not is_owner(msg.from_user.id): return
+    if not await is_logged_in():
+        await msg.answer("Pehle /login karo!"); return
+    if not groups:
+        await msg.answer("Koi group nahi hai. Pehle /start se group banao."); return
+    await msg.answer(
+        "*🚫 Blacklist*\nKaunse group ki blacklist manage karna hai?",
+        parse_mode="Markdown",
+        reply_markup=_group_selection_kb("bl"),
+    )
+
+
+@dp.message_handler(commands=["replace"])
+async def cmd_replace(msg: types.Message):
+    if not is_owner(msg.from_user.id): return
+    if not await is_logged_in():
+        await msg.answer("Pehle /login karo!"); return
+    if not groups:
+        await msg.answer("Koi group nahi hai. Pehle /start se group banao."); return
+    await msg.answer(
+        "*✏️ Word Replace*\nKaunse group ke replace rules manage karna hai?",
+        parse_mode="Markdown",
+        reply_markup=_group_selection_kb("rp"),
+    )
+
+
+@dp.message_handler(commands=["caption"])
+async def cmd_caption(msg: types.Message):
+    if not is_owner(msg.from_user.id): return
+    if not await is_logged_in():
+        await msg.answer("Pehle /login karo!"); return
+    if not groups:
+        await msg.answer("Koi group nahi hai. Pehle /start se group banao."); return
+    await msg.answer(
+        "*📝 Caption Settings*\nKaunse group ki caption setting manage karna hai?",
+        parse_mode="Markdown",
+        reply_markup=_group_selection_kb("cap"),
+    )
 
 
 # ====================================================================
@@ -727,7 +822,8 @@ async def on_callback(cb: types.CallbackQuery):
         if gid not in groups: return
         await load_dialogs()
         await cb.message.edit_text(
-            f"{groups[gid]['name']} — Incoming\nNumber dabao select/deselect:",
+            channel_list_text(groups[gid]['name'], "Incoming"),
+            parse_mode="Markdown",
             reply_markup=kb_channel_select(gid, "incoming"),
         )
 
@@ -765,7 +861,8 @@ async def on_callback(cb: types.CallbackQuery):
         if gid not in groups: return
         await load_dialogs()
         await cb.message.edit_text(
-            f"{groups[gid]['name']} — Outgoing\nNumber dabao select/deselect:",
+            channel_list_text(groups[gid]['name'], "Outgoing"),
+            parse_mode="Markdown",
             reply_markup=kb_channel_select(gid, "outgoing"),
         )
 
