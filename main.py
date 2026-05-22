@@ -3,6 +3,7 @@ import io
 import os
 import re
 import json
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from telethon import TelegramClient, events
 from telethon.tl.types import MessageMediaWebPage
@@ -23,7 +24,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN",    "")
 OWNER_ID  = int(os.getenv("OWNER_ID", "0"))
 MAX_GROUPS  = 5
 DATA_FILE   = "groups_data.json"
-LINK_REGEX  = re.compile(r"https?://\S+", re.IGNORECASE)
+LINK_REGEX     = re.compile(r"https?://\S+", re.IGNORECASE)
+AMAZON_REGEX   = re.compile(r"https?://(?:www\.)?amazon\.in\S+", re.IGNORECASE)
+AFFILIATE_TAG  = os.getenv("AFFILIATE_TAG", "dealskoti-21")
 
 # ---- STATE ----
 groups      = {}   # { gid(int): { name, incoming(set), outgoing(set), active } }
@@ -104,6 +107,65 @@ def has_link(text: str) -> bool:
     if not text:
         return False
     return bool(LINK_REGEX.search(text))
+
+
+def clean_amazon_url(url: str) -> str:
+    """
+    Amazon URL ko clean karo:
+    - Search URL (/s?): sirf k, rh, tag rakho — baaki sab hata do
+    - Product URL (/dp/ASIN): sirf clean dp URL + ek tag rakho
+    - Duplicate tag=... bhi remove ho jaayega
+    - Affiliate tag ensure karo (AFFILIATE_TAG)
+    """
+    try:
+        parsed = urlparse(url)
+        path   = parsed.path
+
+        # --- Search URL: amazon.in/s?k=... ---
+        if re.search(r"^/s\b", path):
+            params = parse_qs(parsed.query, keep_blank_values=False)
+            clean_params = {}
+            if "k" in params:
+                clean_params["k"] = params["k"][0]
+            if "rh" in params:
+                clean_params["rh"] = params["rh"][0]
+            clean_params["tag"] = AFFILIATE_TAG
+            clean_query = urlencode(clean_params)
+            return urlunparse((parsed.scheme, parsed.netloc, path, "", clean_query, ""))
+
+        # --- Product URL: amazon.in/dp/ASIN or amazon.in/.../dp/ASIN/... ---
+        dp_match = re.search(r"(/dp/[A-Z0-9]{10})", path, re.IGNORECASE)
+        if dp_match:
+            clean_path  = dp_match.group(1)
+            clean_query = urlencode({"tag": AFFILIATE_TAG})
+            return urlunparse((parsed.scheme, parsed.netloc, clean_path, "", clean_query, ""))
+
+        # --- Koi aur Amazon URL: sirf duplicate tag fix karo ---
+        params = parse_qs(parsed.query, keep_blank_values=False)
+        params["tag"] = [AFFILIATE_TAG]
+        clean_query = urlencode({k: v[0] for k, v in params.items()})
+        return urlunparse((parsed.scheme, parsed.netloc, path, "", clean_query, ""))
+
+    except Exception:
+        return url
+
+
+def clean_text_urls(text: str) -> str:
+    """
+    Text mein jo bhi Amazon URLs hain unhe clean_amazon_url se replace karo.
+    Non-Amazon URLs untouched rahenge.
+    """
+    if not text:
+        return text
+
+    def replace_url(match):
+        url = match.group(0)
+        parsed = urlparse(url)
+        if "amazon.in" in parsed.netloc.lower():
+            return clean_amazon_url(url)
+        return url
+
+    return LINK_REGEX.sub(replace_url, text)
 
 
 async def load_dialogs():
@@ -1018,7 +1080,7 @@ async def forwarder(event):
         # 1) Webpage preview (link ke saath preview card)
         #    => Sirf text/link send karo (send_file nahi chalega webpage pe)
         if isinstance(m.media, MessageMediaWebPage):
-            text_content = _extract_text(m)
+            text_content = clean_text_urls(_extract_text(m))
             if not has_link(text_content):
                 # Agar link hi nahi toh skip
                 continue
@@ -1030,15 +1092,13 @@ async def forwarder(event):
 
         # 2) Doosra media (photo, video, document, etc.)
         elif m.media:
-            text_content = _extract_text(m)
-            # Agar media message mein link bhi hai toh zaroor forward karo
-            # Agar link nahi hai toh bhi forward karo (normal behavior)
+            clean_caption = clean_text_urls(m.message or "")
             for tgt_id in g["outgoing"]:
                 try:
                     await client.send_file(
                         tgt_id,
                         file=m.media,
-                        caption=m.message or "",
+                        caption=clean_caption,
                     )
                 except Exception as fast_err:
                     print(f"[{g['name']}] Fast fail, downloading: {fast_err}")
@@ -1049,7 +1109,7 @@ async def forwarder(event):
 
         # 3) Pure text message
         elif m.message:
-            text_content = m.message
+            text_content = clean_text_urls(m.message)
             for tgt_id in g["outgoing"]:
                 try:
                     await client.send_message(tgt_id, text_content)
