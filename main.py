@@ -649,7 +649,7 @@ async def on_callback(cb: types.CallbackQuery):
 
     # ---- New Group ----
     elif data == "ng":
-        if await storage.count_groups() >= MAX_GROUPS:
+        if len(groups) >= MAX_GROUPS:
             await cb.answer(f"Max {MAX_GROUPS} groups!", show_alert=True)
             return
         g = await storage.create_group(f"Group {len(groups)+1}")
